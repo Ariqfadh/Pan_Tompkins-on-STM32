@@ -37,6 +37,7 @@
 #define hpfBufferSize 33
 #define derivBufferSize 5
 #define mwiWindowSize 38
+#define REFRACTORY_PERIOD_SAMPLES 75
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -66,11 +67,25 @@ long mwiSum = 0;
 
 //==================== Peak Detection Var ==========================
 
-int peak_spki = 0;
-int peak_npski = 0;
-int peakThreshold1 = 2000;
-int peakThreshold2 = 1000;
+static int spki = 0;
+static int npki = 0;
+static int threshold1 = 0;
+static int threshold2 = 0;
 
+// Variabel untuk melacak RR-Interval
+static int rrAvg = 0;
+static int lastQrs = 0;
+static int rrRecent[8] = {0};
+static int rrRecentPtr = 0;
+
+// State machine untuk mencari puncak
+static int potentialPeakVal = 0;
+static int potentialPeakTime = 0;
+static int signalRising = 0;
+
+// Waktu/sampel global
+static long sample_count = 0;
+static int refractory_period = 0;
 
 /* USER CODE END PV */
 
@@ -105,6 +120,7 @@ static int lowPassFilter(int input){
 	int x6Ptr = (lpfPtr + lpfBufferSize - 6) % lpfBufferSize;
 	int x12Ptr = (lpfPtr + lpfBufferSize - 12 ) % lpfBufferSize;
 	y0 = 2 * lpf_y1 -lpf_y2 + input - 2 *lpf_buffer[x6Ptr] + lpf_buffer[x12Ptr];
+
 
 	lpf_buffer[lpfPtr] = input;
 	lpfPtr = (lpfPtr + 1)% lpfBufferSize;
@@ -167,6 +183,100 @@ static int movingWindowIntegration(int input){
  */
 static int peakDetection(int input){
 
+    sample_count++;
+    int qrs_detected = 0;
+
+    // --- MANAJEMEN WAKTU & REFRAKTER ---
+    if (refractory_period > 0) {
+        refractory_period--;
+        // Update NPK (Noise Peak) jika ada puncak tinggi saat refrakter
+        if (input > npki) {
+            npki = (input / 8) + (npki * 7 / 8);
+        }
+    } else {
+        // --- 1. DETEKSI PUNCAK LOKAL ---
+        if (input > potentialPeakVal) {
+            // Sinyal masih naik, update potensi puncak
+            potentialPeakVal = input;
+            potentialPeakTime = sample_count;
+            signalRising = 1;
+        } else if (signalRising) {
+            // Puncak lokal ditemukan (sinyal mulai turun)
+            int currentPeakVal = potentialPeakVal;
+            int currentPeakTime = potentialPeakTime;
+            signalRising = 0;
+            potentialPeakVal = input;
+
+            // --- 2. ADAPTIVE THRESHOLDING & KLASIFIKASI ---
+            if (currentPeakVal >= threshold1) {
+                // Kandidat QRS (di atas Ambang Batas Sinyal)
+
+                int rrInterval = currentPeakTime - lastQrs;
+
+                // Pengecekan Diskriminasi T-Wave/RR Interval terlalu pendek
+                if (rrInterval < 72 && rrInterval > REFRACTORY_PERIOD_SAMPLES && lastQrs != 0) {
+                    // Terlalu cepat, diklasifikasikan sebagai Noise/T-Wave
+                    npki = (currentPeakVal / 8) + (npki * 7 / 8); // Update NPK
+                } else {
+                    // QRS Terdeteksi!
+                    qrs_detected = 1;
+
+                    // Update SPK (Signal Peak)
+                    spki = (currentPeakVal / 8) + (spki * 7 / 8);
+
+                    // Update Rata-rata RR-Interval
+                    // Logika update rrAvg...
+                    int newRR = currentPeakTime - lastQrs;
+                    if (lastQrs != 0) {
+                        rrRecent[rrRecentPtr] = newRR;
+                        rrRecentPtr = (rrRecentPtr + 1) % 8;
+                        long sumRR = 0;
+                        int countRR = 0;
+                        for(int i = 0; i < 8; i++) {
+                            if (rrRecent[i] > 0) {
+                                sumRR += rrRecent[i];
+                                countRR++;
+                            }
+                        }
+                        if (countRR > 0) {
+                            rrAvg = sumRR / countRR;
+                        }
+                    }
+                    lastQrs = currentPeakTime;
+
+                    // Aktifkan periode refrakter
+                    refractory_period = REFRACTORY_PERIOD_SAMPLES;
+                }
+
+            } else if (currentPeakVal > threshold2) {
+                // Puncak di antara THR1 dan THR2, diklasifikasikan sebagai Noise
+                npki = (currentPeakVal / 8) + (npki * 7 / 8); // Update NPK
+            }
+
+            // --- 3. REKALKULASI AMBANG BATAS ---
+            threshold1 = npki + ((spki - npki) / 4); // THR1 = NPK + 0.25 * (SPK - NPK)
+            threshold2 = threshold1 / 2;             // THR2 = 0.5 * THR1
+
+            // --- 4. SEARCHBACK (PENCARIAN QRS TERLEWAT) ---
+            int rr_limit = (rrAvg * 5) / 3;
+            if (lastQrs != 0 && (sample_count - lastQrs) > rr_limit) {
+                // Jika terlalu lama tanpa deteksi, turunkan ambang batas (penyederhanaan searchback)
+                if (threshold1 > 0) threshold1 = threshold1 / 2;
+                if (threshold2 > 0) threshold2 = threshold2 / 2;
+            }
+        }
+    }
+
+    // --- INISIALISASI AWAL ---
+    if (sample_count < 100 && input > spki) {
+        // Set nilai awal SPK, NPK, dan Ambang batas
+        spki = input;
+        npki = input / 2;
+        threshold1 = npki + ((spki - npki) / 4);
+        threshold2 = threshold1 / 2;
+    }
+
+    return qrs_detected;
 }
 /* USER CODE BEGIN PFP */
 
@@ -174,7 +284,19 @@ static int peakDetection(int input){
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+extern void panTompkins_init(void);
+extern int lowPassFilter(int input);
+extern int highPassFilter(int input);
+extern int derivFilter(int input);
+extern int squaring(int input);
+extern int movingWindowIntegration(int input);
+extern int peakDetection(int input);
 
+int ecg_data[] = {
+	    100,102,105,120,300,500,800,600,400,200,100,90,85,80,75,
+	    100,102,105,110,115,120,250,600,900,700,400,200,120,100
+	};
+int ecg_len = sizeof(ecg_data) / sizeof(int);
 /* USER CODE END 0 */
 
 /**
@@ -208,7 +330,31 @@ int main(void)
   MX_GPIO_Init();
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
+  panTompkins_init();
 
+  printf("Initializing Pan-Tompkins...\n");
+
+  for (int i = 0; i < ecg_len; i++) {
+      int sample = ecg_data[i];
+
+      // Tahapan filter
+      int y_lpf  = lowPassFilter(sample);
+      int y_hpf  = highPassFilter(y_lpf);
+      int y_der  = derivFilter(y_hpf);
+      int y_sqr  = squaring(y_der);
+      int y_mwi  = movingWindowIntegration(y_sqr);
+
+      // Deteksi QRS
+      int detected = peakDetection(y_mwi);
+
+      if (detected) {
+          printf("QRS detected at sample %d (val=%d)\n", i, sample);
+          // Misalnya toggle LED
+          HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
+      }
+
+      HAL_Delay(2); // delay sesuai sampling rate (contoh 500Hz → 2ms)
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
