@@ -1,3 +1,4 @@
+
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
@@ -99,11 +100,25 @@ void panTompkins_init(void){
 	memset(hpf_buffer ,0 , sizeof(hpf_buffer));
 	memset(deriv_buffer ,0 , sizeof(deriv_buffer));
 	memset(mwi_buffer ,0 , sizeof(mwi_buffer));
+    memset(rrRecent, 0, sizeof(rrRecent));
 
 	lpfPtr = 0; lpf_y1 = 0 ; lpf_y2 = 0;
 	hpfPtr = 0; hpf_y1 = 0 ;
 	derivPtr = 0;
 	mwiPtr = 0; mwiSum =0 ;
+
+    spki = 0;
+    npki = 0;
+    threshold1 = 0;
+    threshold2 = 0;
+    rrAvg = 0;
+    lastQrs = 0;
+    rrRecentPtr = 0;
+    potentialPeakVal = 0;
+    potentialPeakTime = 0;
+    signalRising = 0;
+    sample_count = 0;
+    refractory_period = 0;
 
 }
 
@@ -112,15 +127,15 @@ static int lowPassFilter(int input){
 	long y0;
 	int half;
 
-//	history y1 dan y2
-	lpf_y2 = lpf_y1;
-	lpf_y1 = y0;
 
 //	hitung y0
 	int x6Ptr = (lpfPtr + lpfBufferSize - 6) % lpfBufferSize;
 	int x12Ptr = (lpfPtr + lpfBufferSize - 12 ) % lpfBufferSize;
 	y0 = 2 * lpf_y1 -lpf_y2 + input - 2 *lpf_buffer[x6Ptr] + lpf_buffer[x12Ptr];
 
+//	history y1 dan y2
+	lpf_y2 = lpf_y1;
+	lpf_y1 = y0;
 
 	lpf_buffer[lpfPtr] = input;
 	lpfPtr = (lpfPtr + 1)% lpfBufferSize;
@@ -132,13 +147,13 @@ static int lowPassFilter(int input){
 static int highPassFilter(int input){
 	long y0;
 
-	hpf_y1 = y0;
 	int x16Ptr = (hpfPtr + hpfBufferSize - 16) % hpfBufferSize;
 	int x17Ptr = (hpfPtr + hpfBufferSize - 17) % hpfBufferSize;
 	int x32Ptr =(hpfPtr + hpfBufferSize - 32) % hpfBufferSize;
 
 	// Hitung y0
 	y0 = hpf_y1 - (input / 32) + hpf_buffer[x16Ptr] - hpf_buffer[x17Ptr] + (hpf_buffer[x32Ptr] / 32);
+	hpf_y1 = y0;
 	hpf_buffer[hpfPtr] = input;
 	hpfPtr = (hpfPtr + 1) % hpfBufferSize;
 
@@ -214,7 +229,7 @@ static int peakDetection(int input){
                 int rrInterval = currentPeakTime - lastQrs;
 
                 // Pengecekan Diskriminasi T-Wave/RR Interval terlalu pendek
-                if (rrInterval < 72 && rrInterval > REFRACTORY_PERIOD_SAMPLES && lastQrs != 0) {
+                if (rrInterval < 200 && rrInterval > REFRACTORY_PERIOD_SAMPLES && lastQrs != 0) {
                     // Terlalu cepat, diklasifikasikan sebagai Noise/T-Wave
                     npki = (currentPeakVal / 8) + (npki * 7 / 8); // Update NPK
                 } else {
